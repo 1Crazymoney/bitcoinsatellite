@@ -756,6 +756,21 @@ static void ProcessBlockThread(ChainstateManager* chainman)
         block_process_queue.pop();
         process_lock.unlock();
 
+        // Occasionally, a processed block may be added to the block processing
+        // queue again. This is particularly possible during the initialization
+        // stage due to the LoadPartialBlocks loop, which doesn't check whether
+        // the block has been processed already before calling
+        // DoBackgroundBlockProcessing. However, this is intentional given that
+        // it is easier/faster to check setBlocksReceived here instead to avoid
+        // locking cs_mapUDPNodes on LoadPartialBlocks.
+        //
+        // Note the state of setBlocksReceived is only guaranteed by locking
+        // cs_mapUDPNodes. However, the block processing thread is the only
+        // thread that inserts values into setBlocksReceived, so the state is
+        // guaranteed here without locking the referred mutex.
+        if (setBlocksReceived.count(hash_peer_pair))
+            continue;
+
         bool more_work;
         std::unique_lock<std::mutex> lock(block.state_mutex);
         block.awaiting_processing = false;
@@ -1200,6 +1215,18 @@ void LoadPartialBlocks(CTxMemPool* mempool)
             if (!block->Init(cfp)) {
                 LogPrintf("UDP: Got block contents that couldn't match header for block id %lu\n", cfp.hash_prefix);
                 fs::remove(chunk_file_path);
+                continue;
+            }
+
+            // Let the block processing thread process this block if the header
+            // is decodable already. This will be useful to obtain the block
+            // height and check whether this height exists in the chain already.
+            // Furthermore, schedule the background processing if the body is
+            // decodable and the header has been processed already.
+            if ((block->is_header_processing && (!block->chain_lookup)) ||
+                (block->is_decodeable && !block->in_header)) {
+                block->awaiting_processing = true;
+                DoBackgroundBlockProcessing(std::make_pair(hash_peer_pair, block));
             }
         }
     }
