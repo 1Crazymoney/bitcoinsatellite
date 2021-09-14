@@ -1163,6 +1163,7 @@ bool IsChunkFileRecoverable(const std::string& filename, ChunkFileNameParts& cfp
 
 // Scan the disk for recoverable FEC chunk files and try to rebuild the
 // mapPartialBlocks state. Clean up the chunk files that are not recoverable.
+static bool load_partial_blocks_stop = false;
 void LoadPartialBlocks(CTxMemPool* mempool)
 {
     LogPrintf("Loading partial blocks from disk...\n");
@@ -1171,6 +1172,9 @@ void LoadPartialBlocks(CTxMemPool* mempool)
     fs::path chunk_files_dir = GetDataDir() / "partial_blocks";
     if (is_directory(chunk_files_dir)) {
         for (auto& entry : boost::make_iterator_range(fs::directory_iterator(chunk_files_dir), {})) {
+            if (load_partial_blocks_stop)
+                break;
+
             boost::filesystem::path chunk_file_path(entry);
             ChunkFileNameParts cfp;
             if (!IsChunkFileRecoverable(chunk_file_path.filename().string(), cfp)) {
@@ -1183,15 +1187,19 @@ void LoadPartialBlocks(CTxMemPool* mempool)
 
             auto block = GetPartialBlockData(hash_peer_pair);
             if (!block) {
-                // new block
-                mapPartialBlocks.insert(std::make_pair(hash_peer_pair, std::make_shared<PartialBlockData>(peer, mempool, cfp)));
+                auto res = mapPartialBlocks.insert(std::make_pair(hash_peer_pair, std::make_shared<PartialBlockData>(peer, mempool, cfp)));
+                block = res.first->second;
                 n_imported++;
-            } else {
-                // header or body was already recovered
-                if (!block->Init(cfp)) {
-                    LogPrintf("UDP: Got block contents that couldn't match header for block id %lu\n", cfp.hash_prefix);
-                    fs::remove(chunk_file_path);
-                }
+            }
+
+            // HandleBlockTxMessage() calls Init() after locking the state
+            // mutex. Make sure to lock this mutex here too so that there is no
+            // racing between loading a partial block from disk and the
+            // disk-recovery mechanism triggered on reception via UDP.
+            std::unique_lock<std::mutex> lock(block->state_mutex);
+            if (!block->Init(cfp)) {
+                LogPrintf("UDP: Got block contents that couldn't match header for block id %lu\n", cfp.hash_prefix);
+                fs::remove(chunk_file_path);
             }
         }
     }
@@ -1199,6 +1207,11 @@ void LoadPartialBlocks(CTxMemPool* mempool)
     if (n_removed > 0) {
         LogPrintf("Removed %lu non-recoverable partial blocks from disk\n", n_removed);
     }
+}
+
+void StopLoadPartialBlocks()
+{
+    load_partial_blocks_stop = true;
 }
 
 // TODO: Use the one from net_processing (with appropriate lock-free-ness)
@@ -1239,7 +1252,7 @@ bool PartialBlockData::Init(const UDPMessage& msg)
     // "trusted peer") and the block hash prefix.
     std::string chunk_file_prefix = GetChunkFilePrefix(peer, msg.msg.block.hash_prefix);
 
-    if (is_blk_header_chunk) {
+    if (is_blk_header_chunk && !header_initialized) {
         header_decoder = FECDecoder(
             obj_length,
             memory_usage_mode,
@@ -1248,8 +1261,9 @@ bool PartialBlockData::Init(const UDPMessage& msg)
         );
         header_len = obj_length;
         header_initialized = true;
-        assert(header_decoder.GetChunksRcvd() == 0);
-    } else {
+    }
+
+    if (!is_blk_header_chunk && !blk_initialized) {
         body_decoder = FECDecoder(
             obj_length,
             memory_usage_mode,
@@ -1258,13 +1272,9 @@ bool PartialBlockData::Init(const UDPMessage& msg)
         );
         blk_len = obj_length;
         blk_initialized = true;
-        assert(body_decoder.GetChunksRcvd() == 0);
     }
-    // NOTE: Even though the decoder that was just constructed could have
-    // recovered data from a pre-existing mmap file in disk, we don't expect it
-    // to recover data here. At this point, we expect that LoadPartialBlocks()
-    // has already recovered all the data that could be recovered. Hence, the
-    // decoder should be empty at this point. The above assertions verify that.
+    // NOTE: The decoders could be initialized already due the disk data
+    // recovery mechanism from LoadPartialBlocks() executed on a thread.
 
     return true;
 }
@@ -1276,8 +1286,6 @@ PartialBlockData::PartialBlockData(const CService& peer, CTxMemPool* mempool, co
                                                                                                                                                                  chain_lookup(false), currentlyProcessing(false), blk_len(0),
                                                                                                                                                                  header_len(0), block_data(mempool)
 {
-    bool const ret = Init(msg);
-    assert(ret);
 }
 
 
@@ -1287,8 +1295,8 @@ bool PartialBlockData::Init(const ChunkFileNameParts& cfp)
         return false;
 
     std::string chunk_file_prefix = GetChunkFilePrefix(peer, cfp.hash_prefix);
-    if (cfp.is_header) {
-        assert(!header_initialized);
+
+    if (cfp.is_header && !header_initialized) {
         header_decoder = FECDecoder(
             cfp.length,
             MemoryUsageMode::USE_MMAP,
@@ -1299,8 +1307,9 @@ bool PartialBlockData::Init(const ChunkFileNameParts& cfp)
         header_initialized = true;
         // The recovered header object could be decodable already
         is_header_processing = header_decoder.DecodeReady();
-    } else {
-        assert(!blk_initialized);
+    }
+
+    if (!cfp.is_header && !blk_initialized) {
         body_decoder = FECDecoder(
             cfp.length,
             MemoryUsageMode::USE_MMAP,
@@ -1312,6 +1321,12 @@ bool PartialBlockData::Init(const ChunkFileNameParts& cfp)
         // The recovered body object could be decodable already
         is_decodeable = body_decoder.DecodeReady();
     }
+
+    // NOTE: this function finds the decoders in initialized state whenever a
+    // chunk of the same FEC object has been received previously by the Rx
+    // handler (HandleBlockTxMessage). In this case, the data saved in disk has
+    // been recovered already, so it's not necessary to recover it again.
+
     return true;
 }
 
@@ -1322,8 +1337,6 @@ PartialBlockData::PartialBlockData(const CService& peer, CTxMemPool* mempool, co
                                                                                                                chain_lookup(false), currentlyProcessing(false), blk_len(0),
                                                                                                                header_len(0), block_data(mempool), tip_blk(false)
 {
-    bool const ret = Init(cfp);
-    assert(ret);
 }
 
 void PartialBlockData::ReconstructBlockFromDecoder()
