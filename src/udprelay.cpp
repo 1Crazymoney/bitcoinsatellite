@@ -1195,7 +1195,7 @@ void LoadPartialBlocks(CTxMemPool* mempool)
     LogPrintf("Loading partial blocks from disk...\n");
     uint32_t n_imported = 0;
     uint32_t n_removed = 0;
-    fs::path chunk_files_dir = GetDataDir() / "partial_blocks";
+    fs::path chunk_files_dir = gArgs.GetDataDirNet() / "partial_blocks";
     if (is_directory(chunk_files_dir)) {
         for (auto& entry : boost::make_iterator_range(fs::directory_iterator(chunk_files_dir), {})) {
             if (load_partial_blocks_stop)
