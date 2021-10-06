@@ -333,9 +333,6 @@ endif
 if ENABLE_SSSE3
 fec_libbitcoin_fec_a_CXXFLAGS += $(SSSE3_CXXFLAGS)
 endif
-if ENABLE_AVX2
-fec_libbitcoin_fec_a_CXXFLAGS += $(AVX2_CXXFLAGS)
-endif
 
 fec_libbitcoin_fec_a_SOURCES = \
   fec/gf256.h \
