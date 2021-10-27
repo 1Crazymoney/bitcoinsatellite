@@ -172,6 +172,8 @@ deb-packages:
       - TARGET: [
         "bullseye-amd64",
         "bullseye-i386",
+        "bullseye-arm64",
+        "bullseye-armhf",
         "buster-amd64",
         "buster-i386",
         "buster-arm64",
@@ -180,6 +182,7 @@ deb-packages:
         "stretch-i386",
         "stretch-arm64",
         "stretch-armhf",
+        "raspbian-bullseye-armhf",
         "raspbian-buster-armhf",
         "raspbian-stretch-armhf"
         ]
